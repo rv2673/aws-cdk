@@ -255,9 +255,27 @@ export abstract class Resource extends Construct implements IResource {
     return mimicReference(nameAttr, {
       produce: (context: IResolveContext) => {
         const consumingStack = Stack.of(context.scope);
-
-        if (this.stack.account !== consumingStack.account ||
-          (this.stack.region !== consumingStack.region &&
+        const producingStack = this.stack;
+        let highestConsumingStack = consumingStack;
+        let highestProducingStack = producingStack;
+        while (highestConsumingStack !== highestProducingStack &&
+          (highestConsumingStack.nestedStackParent || highestProducingStack.nestedStackParent)
+        ) {
+          if (highestProducingStack.nestedStackParent && highestProducingStack.nestedStackParent === highestConsumingStack) {
+            highestProducingStack = highestProducingStack.nestedStackParent;
+          }
+          if (highestConsumingStack.nestedStackParent && highestConsumingStack.nestedStackParent === highestProducingStack) {
+            highestConsumingStack = highestConsumingStack.nestedStackParent;
+          }
+          if (highestProducingStack.nestedStackParent) {
+            highestProducingStack = highestProducingStack.nestedStackParent;
+          }
+          if (highestConsumingStack.nestedStackParent) {
+            highestConsumingStack = highestConsumingStack.nestedStackParent;
+          }
+        }
+        if (producingStack.account !== consumingStack.account ||
+          (highestProducingStack.region !== highestConsumingStack.region &&
             !consumingStack._crossRegionReferences)) {
           this._enableCrossEnvironment();
           return this.physicalName;

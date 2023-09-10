@@ -64,14 +64,6 @@ function resolveValue(consumer: Stack, reference: CfnReference): IResolvable {
       'Cross stack references are only supported for stacks deployed to the same account or between nested stacks and their parent stack');
   }
 
-  // Stacks are in the same account, but different regions
-  if (producerRegion !== consumerRegion && !consumer._crossRegionReferences) {
-    throw new Error(
-      `Stack "${consumer.node.path}" cannot reference ${renderReference(reference)} in stack "${producer.node.path}". ` +
-      'Cross stack references are only supported for stacks deployed to the same environment or between nested stacks and their parent stack. ' +
-      'Set crossRegionReferences=true to enable cross region references');
-  }
-
   // ----------------------------------------------------------------------
   // consumer is nested in the producer (directly or indirectly)
   // ----------------------------------------------------------------------
@@ -104,11 +96,29 @@ function resolveValue(consumer: Stack, reference: CfnReference): IResolvable {
   }
 
   // ----------------------------------------------------------------------
+  // consumer is nested and not in same region as producer
+  // ----------------------------------------------------------------------
+
+  // Wire through a CloudFormation parameters from parent stack and then resolve
+  // the reference from parent stack as the consumer. Except when consuming stack
+  // opted in to crossRegionReferences feature.
+  if (!consumer._crossRegionReferences && consumer.nestedStackParent && producerRegion !== consumerRegion ) {
+    const parameterValue = resolveValue(consumer.nestedStackParent, reference);
+    return createNestedStackParameter(consumer, reference, parameterValue);
+  }
+
+  // ----------------------------------------------------------------------
   // export/import
   // ----------------------------------------------------------------------
 
   // Stacks are in the same account, but different regions
-  if (producerRegion !== consumerRegion && consumer._crossRegionReferences) {
+  if (producerRegion !== consumerRegion) {
+    if ( !consumer._crossRegionReferences) {
+      throw new Error(
+        `Stack "${consumer.node.path}" cannot reference ${renderReference(reference)} in stack "${producer.node.path}". ` +
+      'Cross stack references are only supported for stacks deployed to the same environment or between nested stacks and their parent stack. ' +
+      'Set crossRegionReferences=true to enable cross region references');
+    }
     if (producerRegion === cxapi.UNKNOWN_REGION || consumerRegion === cxapi.UNKNOWN_REGION) {
       throw new Error(
         `Stack "${consumer.node.path}" cannot reference ${renderReference(reference)} in stack "${producer.node.path}". ` +

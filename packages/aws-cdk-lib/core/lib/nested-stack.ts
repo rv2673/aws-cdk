@@ -4,14 +4,17 @@ import { FileAssetPackaging } from './assets';
 import { Fn } from './cfn-fn';
 import { Aws } from './cfn-pseudo';
 import { CfnResource } from './cfn-resource';
-import { CfnStack } from './cloudformation.generated';
+import { CfnStack, CfnStackProps } from './cloudformation.generated';
+import { CrossRegionNestedStack } from './custom-resource-provider/cross-region-nested-stack-provider/cross-region-nested-stack-provider';
 import { Duration } from './duration';
+import { Environment } from './environment';
 import { Lazy } from './lazy';
 import { Names } from './names';
 import { RemovalPolicy } from './removal-policy';
 import { IResolveContext } from './resolvable';
 import { Stack } from './stack';
 import { NestedStackSynthesizer } from './stack-synthesizers';
+import { TagManager } from './tag-manager';
 import { Token } from './token';
 import * as cxapi from '../../cx-api';
 
@@ -75,6 +78,26 @@ export interface NestedStackProps {
    * @default - No description.
    */
   readonly description?: string;
+
+  /**
+   * The AWS environment (account/region) where this stack will be deployed.
+   *
+   * @default - The environment of the containing `Stack`
+   */
+  readonly env?: Environment;
+}
+/**
+ * Properties for an StackResource created for nested stacks
+ */
+export interface StackResourceProps extends CfnStackProps {
+  /**
+  * Region to deploy the stack in.
+  *
+  * NOTE: When region is different from parent stack custom resource will be used.
+  *
+  * @default - same region as the parent stack
+  */
+  readonly targetRegion?: string
 }
 
 /**
@@ -107,17 +130,18 @@ export class NestedStack extends Stack {
   public readonly nestedStackResource?: CfnResource;
 
   private readonly parameters: { [name: string]: string };
-  private readonly resource: CfnStack;
+  private readonly resource: CfnResource;
   private readonly _contextualStackId: string;
   private readonly _contextualStackName: string;
   private _templateUrl?: string;
   private _parentStack: Stack;
+  private _nestedStackResourceTagManager?: TagManager
 
   constructor(scope: Construct, id: string, props: NestedStackProps = { }) {
     const parentStack = findParentStack(scope);
 
     super(scope, id, {
-      env: { account: parentStack.account, region: parentStack.region },
+      env: { account: props.env?.account ?? parentStack.account, region: props.env?.region ?? parentStack.region },
       synthesizer: new NestedStackSynthesizer(parentStack.synthesizer),
       description: props.description,
       crossRegionReferences: parentStack._crossRegionReferences,
@@ -134,12 +158,13 @@ export class NestedStack extends Stack {
 
     this.parameters = props.parameters || {};
 
-    this.resource = new CfnStack(parentScope, `${id}.NestedStackResource`, {
+    this.resource = this.generateStackResource(parentScope, `${id}.NestedStackResource`, {
       // This value cannot be cached since it changes during the synthesis phase
       templateUrl: Lazy.uncachedString({ produce: () => this._templateUrl || '<unresolved>' }),
       parameters: Lazy.any({ produce: () => Object.keys(this.parameters).length > 0 ? this.parameters : undefined }),
       notificationArns: props.notificationArns,
       timeoutInMinutes: props.timeout ? props.timeout.toMinutes() : undefined,
+      targetRegion: props.env?.region,
     });
     this.resource.applyRemovalPolicy(props.removalPolicy ?? RemovalPolicy.DESTROY);
 
@@ -152,6 +177,26 @@ export class NestedStack extends Stack {
     // component after splitting by "/"
     this._contextualStackName = this.contextualAttribute(Aws.STACK_NAME, Fn.select(1, Fn.split('/', this.resource.ref)));
     this._contextualStackId = this.contextualAttribute(Aws.STACK_ID, this.resource.ref);
+  }
+
+  protected generateStackResource (scope: Construct, id: string, props: StackResourceProps): CfnResource {
+    const { targetRegion, ...stackProps } = props;
+    const currentRegion = Stack.of(scope).region;
+    if (targetRegion && targetRegion !== currentRegion) {
+      const crossRegionStack = new CrossRegionNestedStack(scope, id, {
+        ...stackProps,
+        targetRegion,
+      });
+      this.nestedStackResourceTags = crossRegionStack.tags;
+      return crossRegionStack.cfnResource;
+    }
+    const cfnStack = new CfnStack(scope, id, stackProps);
+    this.nestedStackResourceTags =cfnStack.tags;
+    return cfnStack;
+  }
+
+  protected set nestedStackResourceTags (tagManager: TagManager) {
+    this._nestedStackResourceTagManager = tagManager;
   }
 
   /**
@@ -216,9 +261,12 @@ export class NestedStack extends Stack {
     // by this class don't share the same TagManager as that of the one exposed by the `tag` property of the
     //  class, all the tags need to be copied to the CfnStack resource before synthesizing the resource.
     // See https://github.com/aws/aws-cdk/pull/19128
-    Object.entries(this.tags.tagValues()).forEach(([key, value]) => {
-      this.resource.tags.setTag(key, value);
-    });
+    if (this._nestedStackResourceTagManager) {
+      const tagManager = this._nestedStackResourceTagManager;
+      Object.entries(this.tags.tagValues()).forEach(([key, value]) => {
+        tagManager.setTag(key, value);
+      });
+    }
 
     const cfn = JSON.stringify(this._toCloudFormation());
     const templateHash = crypto.createHash('sha256').update(cfn).digest('hex');
