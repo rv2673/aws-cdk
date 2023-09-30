@@ -1,5 +1,7 @@
 import * as https from 'https';
 import * as url from 'url';
+// eslint-disable-next-line import/no-extraneous-dependencies
+import { SFN, type StartExecutionInput, type StartExecutionOutput } from '@aws-sdk/client-sfn';
 
 // for unit tests
 export const external = {
@@ -12,6 +14,12 @@ export const external = {
 const CREATE_FAILED_PHYSICAL_ID_MARKER = 'AWSCDK::CustomResourceProviderFramework::CREATE_FAILED';
 const MISSING_PHYSICAL_ID_MARKER = 'AWSCDK::CustomResourceProviderFramework::MISSING_PHYSICAL_ID';
 
+export const COMPLETE_KEY = 'IsComplete';
+const WAITING_KEY = 'IsWaiting';
+export const WAITER_ARN_ENV_VARIABLE = 'CUSTOM_RESOURCE_WAITER_ARN';
+const WAITER_ARN = process.env[WAITER_ARN_ENV_VARIABLE];
+const WAITER_ENABLED = !!WAITER_ARN;
+
 export type Response = AWSLambda.CloudFormationCustomResourceEvent & HandlerResponse;
 export type Handler = (event: AWSLambda.CloudFormationCustomResourceEvent, context: AWSLambda.Context) => Promise<HandlerResponse | void>;
 export type HandlerResponse = undefined | {
@@ -20,8 +28,20 @@ export type HandlerResponse = undefined | {
   Reason?: string;
   NoEcho?: boolean;
 };
+export type TimeoutEvent = {
+  Cause: string
+}
+export type IsCompleteRequest = AWSLambda.CloudFormationCustomResourceEvent & HandlerResponse & {
+  IsWaiting?: boolean
+}
 
-export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent, context: AWSLambda.Context) {
+class Retry extends Error { }
+
+export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent | IsCompleteRequest | TimeoutEvent, context: AWSLambda.Context) {
+  if ('Cause' in event) {
+    // Is timeout event
+    return onTimeout(event);
+  }
   const sanitizedEvent = { ...event, ResponseURL: '...' };
   external.log(JSON.stringify(sanitizedEvent, undefined, 2));
 
@@ -45,9 +65,47 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
     // validate user response and create the combined event
     const responseEvent = renderResponse(event, result);
 
-    // submit to cfn as success
-    await submitResponse('SUCCESS', responseEvent);
+    // If this is an not async provider based on whether we have a waiter,
+    // or if response is marking action complete in case of async handler
+    // then we can return a positive response.
+    if (!WAITER_ENABLED || (COMPLETE_KEY in responseEvent && responseEvent[COMPLETE_KEY] === true)) {
+      // submit to cfn as success
+      await submitResponse('SUCCESS', responseEvent);
+      return;
+    }
+    // We explicitly check for Complete field to be false
+    // otherwise we might repeatedly invoke (create) event handler when it does
+    // not expect to be invoked for complete checking
+    if (!(COMPLETE_KEY in responseEvent) || responseEvent[COMPLETE_KEY] !== false) {
+      await submitResponse('FAILED', {
+        ...responseEvent,
+        Reason: 'Async handler implementation failed to explictly mark action with IsComplete',
+      });
+      return;
+    }
+
+    if (!('IsWaiting' in event)) {
+      // not yet waiting so kicking off waiter
+      const waiter = {
+        stateMachineArn: WAITER_ARN,
+        name: responseEvent.RequestId,
+        input: JSON.stringify({
+          ...responseEvent,
+          [WAITING_KEY]: true,
+        }),
+      };
+      external.log('starting waiter', waiter);
+      // kick off waiter state machine
+      await startExecution(waiter);
+    } else {
+      // Not complete so throw, so waiter will trigger retry.
+      // Adding serialized event so timeout task gets event, when retries are exhausted.
+      throw new Retry(JSON.stringify(event));
+    }
   } catch (e: any) {
+    if (e instanceof Retry) {
+      throw e;
+    }
     const resp: Response = {
       ...event,
       Reason: external.includeStackTraces ? e.stack : e.message,
@@ -72,6 +130,22 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
     // this is an actual error, fail the activity altogether and exist.
     await submitResponse('FAILED', resp);
   }
+}
+
+let sfn: SFN;
+async function startExecution(req: StartExecutionInput): Promise<StartExecutionOutput> {
+  if (!sfn) {
+    sfn = new SFN({});
+  }
+
+  return sfn.startExecution(req);
+}
+
+// invoked when completion retries are exhausted.
+async function onTimeout(timeoutEvent: any) {
+  external.log('timeoutHandler', timeoutEvent);
+  const completeRequest = JSON.parse(JSON.parse(timeoutEvent.Cause).errorMessage) as IsCompleteRequest;
+  await submitResponse('FAILED', { ...completeRequest, Reason: 'Operation timed out' });
 }
 
 function renderResponse(

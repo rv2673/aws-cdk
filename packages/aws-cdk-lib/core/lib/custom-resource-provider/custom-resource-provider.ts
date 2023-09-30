@@ -1,7 +1,9 @@
 import * as path from 'path';
 import { Construct } from 'constructs';
 import * as fs from 'fs-extra';
+import { WAITER_ARN_ENV_VARIABLE } from './nodejs-entrypoint';
 import * as cxapi from '../../../cx-api';
+import { Annotations } from '../annotations';
 import { AssetStaging } from '../asset-staging';
 import { FileAssetPackaging } from '../assets';
 import { CfnResource } from '../cfn-resource';
@@ -9,6 +11,7 @@ import { Duration } from '../duration';
 import { FileSystem } from '../fs';
 import { PolicySynthesizer, getPrecreatedRoleConfig } from '../helpers-internal';
 import { Lazy } from '../lazy';
+import { makeUniqueResourceName } from '../private/unique-resource-name';
 import { Size } from '../size';
 import { Stack } from '../stack';
 import { Token } from '../token';
@@ -16,6 +19,31 @@ import { Token } from '../token';
 const ENTRYPOINT_FILENAME = '__entrypoint__';
 const ENTRYPOINT_NODEJS_SOURCE = path.join(__dirname, 'nodejs-entrypoint.js');
 export const INLINE_CUSTOM_RESOURCE_CONTEXT = '@aws-cdk/core:inlineCustomResourceIfPossible';
+
+/**
+ * Log Options for the state machine.
+ */
+export interface CustomResourceWaiterLogOptions {
+  /**
+   * Determines whether execution data is included in your log.
+   *
+   * @default false
+   */
+  readonly includeExecutionData?: boolean;
+
+  /**
+   * Defines which category of execution history events are logged.
+   *
+   * @default ERROR
+   */
+  readonly level?: 'OFF' | 'ALL' | 'ERROR' | 'FATAL';
+
+  /**
+   * The number of days to retain the log events in the specified log group.
+   * @default 60 days
+   */
+  readonly retention?: Duration
+}
 
 /**
  * Initialization properties for `CustomResourceProvider`.
@@ -95,6 +123,51 @@ export interface CustomResourceProviderProps {
    * @default - No description.
    */
   readonly description?: string;
+
+  /**
+   * Whether handler might not handle all operations completely in first invocation
+   *
+   * When `true` creates state machine to periodically check if operation is completed
+   * by re-invoking the handler with original event with additional fields,
+   * IsWaiting=true and IsComplete=false, until IsComplete is returned `true` or retries
+   * are exhausted.
+   *
+   * @default - provider is synchronous. This means that the handler
+   * is expected to finish all lifecycle operations within the initial invocation.
+   */
+  readonly handleAsync?: boolean;
+
+  /**
+   * In case of async handler the total timeout to indicate how long the
+   * waiter will wait. Has no effect for non async handler. Can exceed 15 min,
+   * and be max 1 hour.
+   *
+   * NOTE: Must be multiple of query interval
+   * @default - 30 min
+   */
+  readonly waiterTotalTimeout?: Duration
+
+  /**
+   * In case of async handler the interval for the interval the resource action
+   * is checked to be completed. Has no effect for non async handler.
+   *
+   * NOTE: Must integrally divide totalTimeout
+   * @default - 30 seconds
+   */
+  readonly waiterQueryInterval?: Duration
+
+  /**
+   * Log options for Loggroup used for logging of waiter in case handler is async.
+   *
+   * @default - no log options
+   */
+  readonly waiterLogOptions?: CustomResourceWaiterLogOptions;
+
+  /**
+   * Disable waiter state machine logs
+   * @default false
+   */
+  readonly disableWaiterLogs?: boolean
 }
 
 /**
@@ -232,6 +305,14 @@ export class CustomResourceProvider extends Construct {
   protected constructor(scope: Construct, id: string, props: CustomResourceProviderProps) {
     super(scope, id);
 
+    if (props.handleAsync &&
+      (props.waiterLogOptions || props.waiterTotalTimeout || props.waiterQueryInterval || 'disableWaiterLogs' in props)
+    ) {
+      Annotations.of(this).addWarning(
+        'waiterLogOptions,waiterTotalTimeout, waiterQueryInterval and/or disableWaiterLogs can only be specified when handleAsync=True',
+      );
+    }
+
     const stack = Stack.of(scope);
 
     // verify we have an index file there
@@ -248,8 +329,56 @@ export class CustomResourceProvider extends Construct {
     }
 
     const config = getPrecreatedRoleConfig(this, `${this.node.path}/Role`);
-    const assumeRolePolicyDoc = [{ Action: 'sts:AssumeRole', Effect: 'Allow', Principal: { Service: 'lambda.amazonaws.com' } }];
+    type AssumePolicyStatement = {
+      Action: string,
+      Effect: 'Allow'| 'Deny',
+      Principal: {Service: string},
+      Condition?: Record<string, Record<string, string>>
+    }
+    const assumeRolePolicyDoc: AssumePolicyStatement[] = [
+      { Action: 'sts:AssumeRole', Effect: 'Allow', Principal: { Service: 'lambda.amazonaws.com' } },
+    ];
     const managedPolicyArn = 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole';
+
+    let handlerName: string | undefined;
+    let handlerArn: string | undefined;
+    let waiterName: string | undefined;
+    let waiterArn: string | undefined;
+    let waiterDefinition: string | undefined;
+    if (props.handleAsync) {
+      handlerName = makeUniqueResourceName([stack.stackName, id, 'Handler'], { maxLength: 128 });
+      handlerArn = `arn:${stack.partition}:lambda:${stack.region}:${stack.account}:function:${handlerName}`;
+      waiterName = makeUniqueResourceName([stack.stackName, id, 'Waiter'], { maxLength: 128 });
+      waiterArn = `arn:${stack.partition}:states:${stack.region}:${stack.account}:stateMachine:${waiterName}`;
+      assumeRolePolicyDoc.push( {
+        Action: 'sts:AssumeRole',
+        Effect: 'Allow',
+        Principal: { Service: 'states.amazonaws.com' },
+        Condition: {
+          ArnLike: {
+            'aws:SourceArn': waiterArn,
+          },
+          StringEquals: {
+            'aws:SourceAccount': stack.account,
+          },
+        },
+      });
+      this.addToRolePolicy(
+        {
+          Effect: 'Allow',
+          Action: ['states:StartExecution'],
+          Resource: [waiterArn],
+        },
+      );
+      this.addToRolePolicy(
+        {
+          Effect: 'Allow',
+          Action: ['lambda:InvokeFunction'],
+          Resource: [handlerArn],
+        },
+      );
+      waiterDefinition = this.createWaiterDefinition(handlerArn, props.waiterTotalTimeout, props.waiterQueryInterval);
+    }
 
     // need to initialize this attribute, but there should never be an instance
     // where config.enabled=true && config.preventSynthesis=true
@@ -298,13 +427,17 @@ export class CustomResourceProvider extends Construct {
     const handler = new CfnResource(this, 'Handler', {
       type: 'AWS::Lambda::Function',
       properties: {
+        FunctionName: handlerName,
         Code: code,
         Timeout: timeout.toSeconds(),
         MemorySize: memory.toMebibytes(),
         Handler: codeHandler,
         Role: this.roleArn,
         Runtime: customResourceProviderRuntimeToString(props.runtime),
-        Environment: this.renderEnvironmentVariables(props.environment),
+        Environment: this.renderEnvironmentVariables({
+          ...props.environment,
+          ...(waiterArn && { [WAITER_ARN_ENV_VARIABLE]: waiterArn }),
+        }),
         Description: props.description ?? undefined,
       },
     });
@@ -315,6 +448,41 @@ export class CustomResourceProvider extends Construct {
 
     if (metadata) {
       Object.entries(metadata).forEach(([k, v]) => handler.addMetadata(k, v));
+    }
+    if (waiterDefinition) {
+      let waiterLoggingConfiguration;
+      if (!props.disableWaiterLogs) {
+        const waiterLogGroup = new CfnResource(this, 'WaiterLogs', {
+          type: 'AWS::Logs::LogGroup',
+          properties: {
+            LogGroupName: `/cdk/custom-resource/waiter/${waiterName}`,
+            RetentionDays: (props.waiterLogOptions?.retention ?? Duration.days(60)).toDays(),
+          },
+        });
+        waiterLoggingConfiguration = {
+          Destinations: [
+            {
+              CloudWatchLogsLogGroup: waiterLogGroup,
+              IncludeExecutionData: props.waiterLogOptions?.includeExecutionData ?? false,
+              Level: props.waiterLogOptions?.level ?? 'ERROR',
+            },
+          ],
+        };
+      }
+      const waiter = new CfnResource(this, 'Waiter', {
+        type: 'AWS::StepFunctions::StateMachine',
+        properties: {
+          StateMachineName: waiterName,
+          DefinitionString: waiterDefinition,
+          RoleArn: this.roleArn,
+          LoggingConfiguration: waiterLoggingConfiguration,
+        },
+      });
+
+      waiter.addDependency(handler);
+      if (this._role) {
+        waiter.addDependency(this._role);
+      }
     }
 
     this.serviceToken = Token.asString(handler.getAtt('Arn'));
@@ -437,6 +605,35 @@ export class CustomResourceProvider extends Construct {
 
     return { Variables: variables };
   }
+
+  private createWaiterDefinition(handlerArn: string, totalTimeout?: Duration, queryInterval?: Duration ) {
+    const retry = calculateRetryPolicy({ totalTimeout, queryInterval });
+    return Stack.of(this).toJsonString({
+      StartAt: 'isComplete-task',
+      States: {
+        'isComplete-task': {
+          End: true,
+          Retry: [{
+            ErrorEquals: ['States.ALL'],
+            IntervalSeconds: retry.interval,
+            MaxAttempts: retry.maxAttempts,
+            BackoffRate: retry.backoffRate,
+          }],
+          Catch: [{
+            ErrorEquals: ['States.ALL'],
+            Next: 'onTimeout-task',
+          }],
+          Type: 'Task',
+          Resource: handlerArn,
+        },
+        'onTimeout-task': {
+          End: true,
+          Type: 'Task',
+          Resource: handlerArn,
+        },
+      },
+    });
+  }
 }
 
 function customResourceProviderRuntimeToString(x: CustomResourceProviderRuntime): string {
@@ -459,3 +656,22 @@ type Code = {
   S3Bucket: string,
   S3Key: string,
 };
+
+const DEFAULT_TIMEOUT = Duration.minutes(30);
+const DEFAULT_INTERVAL = Duration.seconds(30);
+
+function calculateRetryPolicy(props: { totalTimeout?: Duration, queryInterval?: Duration } = { }) {
+  const totalTimeout = props.totalTimeout || DEFAULT_TIMEOUT;
+  const interval = props.queryInterval || DEFAULT_INTERVAL;
+  const maxAttempts = totalTimeout.toSeconds() / interval.toSeconds();
+
+  if (Math.round(maxAttempts) !== maxAttempts) {
+    throw new Error(`Cannot determine retry count since totalTimeout=${totalTimeout.toSeconds()}s is not integrally dividable by queryInterval=${interval.toSeconds()}s`);
+  }
+
+  return {
+    maxAttempts,
+    interval,
+    backoffRate: 1,
+  };
+}
